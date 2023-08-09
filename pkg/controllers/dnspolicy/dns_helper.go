@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -22,6 +23,7 @@ import (
 	"github.com/Kuadrant/multicluster-gateway-controller/pkg/apis/v1alpha1"
 	"github.com/Kuadrant/multicluster-gateway-controller/pkg/dns"
 	"github.com/Kuadrant/multicluster-gateway-controller/pkg/traffic"
+	"github.com/kuadrant/kuadrant-operator/pkg/common"
 )
 
 var (
@@ -336,4 +338,36 @@ func createOrUpdateEndpoint(dnsName string, targets v1alpha1.Targets, recordType
 	endpoint.Targets = targets
 	endpoint.RecordTTL = recordTTL
 	return endpoint
+}
+
+func getDNSHealthCheckProbes(ctx context.Context, apiClient client.Client, gateway common.GatewayWrapper, dnsPolicy *v1alpha1.DNSPolicy) ([]*v1alpha1.DNSHealthCheckProbe, error) {
+	list := &v1alpha1.DNSHealthCheckProbeList{}
+	if err := apiClient.List(ctx, list, &client.ListOptions{
+		LabelSelector: labels.SelectorFromSet(dnsRecordLabels(client.ObjectKeyFromObject(gateway), client.ObjectKeyFromObject(dnsPolicy))),
+	}); err != nil {
+		return nil, err
+	}
+
+	return slice.MapErr(list.Items, func(obj v1alpha1.DNSHealthCheckProbe) (*v1alpha1.DNSHealthCheckProbe, error) {
+		return &obj, nil
+	})
+}
+
+func propagateHealthStatus(dnsRecord *v1alpha1.DNSRecord, probes []*v1alpha1.DNSHealthCheckProbe) {
+	for _, endpoint := range dnsRecord.Spec.Endpoints {
+
+		for _, target := range endpoint.Targets {
+			probe, ok := slice.Find(probes, func(probe *v1alpha1.DNSHealthCheckProbe) bool {
+				return probe.Spec.Host == endpoint.DNSName && probe.Spec.Address == target
+			})
+			if !ok {
+				continue
+			}
+
+			probeHealthy := probe.Status.Healthy || probe.Status.ConsecutiveFailures <= *probe.Spec.FailureThreshold
+
+			endpoint.SetProviderSpecific(fmt.Sprintf("health/%s/status", target), strconv.FormatBool(probeHealthy))
+		}
+
+	}
 }
